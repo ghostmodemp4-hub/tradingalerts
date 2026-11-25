@@ -1,0 +1,1114 @@
+import os
+import time
+import threading
+from datetime import datetime, timezone
+
+try:
+    import requests as _requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
+os.environ["LD_LIBRARY_PATH"] = "/app/forexconnect/lib"
+
+try:
+    from forexconnect import (
+        ForexConnect,
+        fxcorepy,
+    )
+    FXCM_AVAILABLE = True
+except Exception as _fxcm_import_error:
+    print(
+        f"⚠️  ForexConnect library not available on this platform "
+        f"({_fxcm_import_error}). FXCM instruments disabled.",
+        flush=True,
+    )
+    ForexConnect = None
+    fxcorepy = None
+    FXCM_AVAILABLE = False
+
+
+# ==================================================
+# SETTINGS
+# ==================================================
+
+STALE_PRICE_SECONDS = 180
+
+RECONNECT_COOLDOWN_SECONDS = 60
+
+
+# ==================================================
+# COMMON SYMBOLS
+# ==================================================
+
+COMMON_FOREX = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "NZDUSD",
+
+    "EURGBP",
+    "EURJPY",
+    "EURCHF",
+    "EURAUD",
+
+    "GBPJPY",
+    "GBPCHF",
+    "GBPAUD",
+
+    "AUDJPY",
+    "CADJPY",
+    "CHFJPY",
+    "NZDJPY",
+
+    "AUDCAD",
+    "AUDNZD",
+    "EURNZD",
+    "GBPCAD",
+]
+
+
+COMMON_COMMODITIES = [
+    "XAUUSD",
+    "XAGUSD",
+    "USOIL",
+    "COPPER",
+]
+
+
+# ==================================================
+# SYMBOL MAPPING
+# ==================================================
+
+FXCM_SYMBOL_MAP = {
+    "US100": "NAS100",
+}
+
+
+# ==================================================
+# YAHOO FINANCE FALLBACK FOR INDICES
+#
+# FXCM demo accounts throttle index tick rates heavily
+# (NAS100 may not update for minutes at a time).
+# Yahoo Finance futures prices are used for index symbols
+# instead, giving live data for all account types.
+# ==================================================
+
+YAHOO_INDEX_MAP = {
+    "NAS100": "NQ=F",   # CME Nasdaq-100 E-mini futures
+    "SPX500": "ES=F",   # CME S&P 500 E-mini futures
+    "US30":   "YM=F",   # CME Dow Jones E-mini futures
+    "GER30":  "FDAX=F", # Eurex DAX futures
+    "UK100":  "Z=F",    # ICE FTSE 100 futures
+}
+
+TYPICAL_INDEX_SPREAD = {
+    "NAS100": 2.0,
+    "SPX500": 0.5,
+    "US30":   2.0,
+    "GER30":  1.5,
+    "UK100":  1.0,
+}
+
+
+def _get_yahoo_index_price(symbol):
+    """
+    Fetch the current price for an index via Yahoo Finance.
+    Returns a dict with bid/ask estimated from the mid-price and typical spread,
+    or None if Yahoo Finance is unavailable.
+    """
+
+    if not _REQUESTS_AVAILABLE:
+        return None
+
+    yahoo_sym = YAHOO_INDEX_MAP.get(symbol)
+    if not yahoo_sym:
+        return None
+
+    url = (
+        "https://query2.finance.yahoo.com"
+        f"/v8/finance/chart/{yahoo_sym}"
+    )
+
+    resp = _requests.get(
+        url,
+        params={"interval": "1m", "range": "1d"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=8,
+    )
+
+    resp.raise_for_status()
+
+    meta = resp.json()["chart"]["result"][0]["meta"]
+
+    price = float(meta["regularMarketPrice"])
+
+    if price <= 0:
+        raise ValueError(
+            f"Yahoo returned invalid price for {symbol}: {price}"
+        )
+
+    spread = TYPICAL_INDEX_SPREAD.get(symbol, price * 0.0001)
+
+    return {
+        "symbol": symbol,
+        "bid": round(price - spread / 2, 2),
+        "ask": round(price + spread / 2, 2),
+    }
+
+
+# ==================================================
+# GLOBAL FXCM STATE
+# ==================================================
+
+fx_connection = None
+
+connection_lock = threading.RLock()
+
+last_reconnect_attempt = 0.0
+
+
+# Stores last observed bid / ask for each symbol.
+#
+# Example:
+#
+# {
+#     "GBPUSD": {
+#         "bid": 1.33180,
+#         "ask": 1.33193,
+#         "changed_at": 123456.78
+#     }
+# }
+
+last_quotes = {}
+
+
+# ==================================================
+# NORMALIZE SYMBOL
+# ==================================================
+
+def normalize_symbol(symbol):
+
+    symbol = (
+        symbol
+        .upper()
+        .replace("/", "")
+        .replace(" ", "")
+    )
+
+    return FXCM_SYMBOL_MAP.get(
+        symbol,
+        symbol,
+    )
+
+
+# ==================================================
+# MARKET TIME CHECK
+# ==================================================
+
+def forex_market_should_be_active():
+    """
+    Used only for stale-price detection (forex / default).
+
+    Monday-Thursday: always active.
+    Friday: active until ~22:00 UTC.
+    Saturday: inactive.
+    Sunday: active after ~22:00 UTC.
+    """
+
+    now     = datetime.now(timezone.utc)
+    weekday = now.weekday()
+    hour    = now.hour
+
+    if weekday in (0, 1, 2, 3):
+        return True
+    if weekday == 4:
+        return hour < 22
+    if weekday == 6:
+        return hour >= 22
+    return False
+
+
+def _in_window(hm, open_min, close_min):
+    """
+    Return True if hm (hour*60+minute) is inside [open_min, close_min).
+    Handles overnight windows where close_min < open_min.
+    """
+    if open_min <= close_min:
+        return open_min <= hm < close_min
+    # Overnight window (e.g. 22:00 → 01:00 next day)
+    return hm >= open_min or hm < close_min
+
+
+# Exchange hours in UTC: (open_h, open_m, close_h, close_m)
+# Used ONLY for stale-price detection — avoids reconnects when
+# an exchange is legitimately closed.
+_EXCHANGE_HOURS = {
+    ".JP":  (0,  0,  6, 30),   # Tokyo Stock Exchange
+    ".HK":  (1, 30,  8,  0),   # Hong Kong Stock Exchange
+    ".US":  (14, 30, 21,  0),  # NYSE / NASDAQ
+    ".CA":  (14, 30, 21,  0),  # Toronto Stock Exchange
+    ".EXT": (10,  0,  1,  0),  # US extended hours (overnight window)
+    ".DE":  (7,   0, 15, 30),  # Deutsche Börse / XETRA
+    ".FR":  (7,   0, 15, 30),  # Euronext Paris
+    ".NL":  (7,   0, 15, 30),  # Euronext Amsterdam
+    ".UK":  (8,   0, 16, 30),  # London Stock Exchange
+}
+
+# Thematic baskets that follow US stock hours
+_US_HOURS_BASKETS = frozenset({
+    "AIRLINES", "BIOTECH", "CANNABIS", "CASINOS",
+    "CRYPTOSTOCK", "ESPORTS", "FAANG", "MAG7.24H",
+    "TRAVEL", "URANIUM", "WFH",
+    "US.AUTO", "US.BANKS", "US.ECOMM",
+    "CHN.ECOMM", "CHN.TECH",
+})
+
+
+def market_should_be_active(symbol):
+    """
+    Returns True when the exchange for this symbol is expected to be open.
+    Used only for stale-price detection — prevents false reconnects when
+    an exchange is legitimately closed overnight or on weekends.
+    """
+
+    now     = datetime.now(timezone.utc)
+    weekday = now.weekday()   # 0=Mon … 6=Sun
+    hm      = now.hour * 60 + now.minute
+
+    # Weekends: all stock exchanges closed
+    if weekday == 5:          # Saturday
+        # Only forex / crypto are active over the weekend
+        pass                  # fall through to suffix / forex check
+    if weekday == 6 and symbol.endswith(
+        (".JP", ".HK", ".US", ".CA", ".EXT", ".DE", ".FR", ".NL", ".UK")
+    ):
+        return False
+
+    # Per-exchange suffix check
+    for suffix, (oh, om, ch, cm) in _EXCHANGE_HOURS.items():
+        if symbol.endswith(suffix):
+            if weekday == 5:  # Saturday — all stock exchanges closed
+                return False
+            open_min  = oh * 60 + om
+            close_min = ch * 60 + cm
+            return _in_window(hm, open_min, close_min)
+
+    # US-hours thematic baskets
+    if symbol in _US_HOURS_BASKETS:
+        if weekday in (5, 6):
+            return False
+        return _in_window(hm, 870, 1260)   # 14:30 – 21:00 UTC
+
+    # Default: forex market hours
+    return forex_market_should_be_active()
+
+
+# ==================================================
+# CHECK SESSION
+# ==================================================
+
+def session_is_connected():
+
+    global fx_connection
+
+    if fx_connection is None:
+        return False
+
+    if not FXCM_AVAILABLE:
+        return False
+
+    try:
+
+        status = fx_connection.session.session_status
+
+        connected_status = (
+            fxcorepy
+            .AO2GSessionStatus
+            .O2GSessionStatus
+            .CONNECTED
+        )
+
+        return status == connected_status
+
+    except Exception:
+        return False
+
+
+# ==================================================
+# CLOSE CONNECTION
+# ==================================================
+
+def close_fxcm():
+
+    global fx_connection
+
+    with connection_lock:
+
+        old_connection = fx_connection
+
+        fx_connection = None
+
+        if old_connection is None:
+            return
+
+        try:
+
+            old_connection.logout()
+
+        except Exception as e:
+
+            print(
+                f"FXCM logout warning: {e}",
+                flush=True,
+            )
+
+        print(
+            "🔌 FXCM disconnected",
+            flush=True,
+        )
+
+
+# ==================================================
+# INITIALIZE FXCM
+# ==================================================
+
+def init_fxcm(force=False):
+
+    if not FXCM_AVAILABLE:
+        print(
+            "⚠️  FXCM not available on this platform — skipping init",
+            flush=True,
+        )
+        return None
+
+    global fx_connection
+
+    with connection_lock:
+
+        # ------------------------------------------
+        # Existing healthy connection
+        # ------------------------------------------
+
+        if (
+            not force
+            and fx_connection is not None
+            and session_is_connected()
+        ):
+
+            print(
+                "FXCM already connected",
+                flush=True,
+            )
+
+            return fx_connection
+
+
+        # ------------------------------------------
+        # Remove old connection
+        # ------------------------------------------
+
+        if fx_connection is not None:
+
+            old_connection = fx_connection
+
+            fx_connection = None
+
+            try:
+
+                old_connection.logout()
+
+            except Exception:
+                pass
+
+
+        # ------------------------------------------
+        # Environment variables
+        # ------------------------------------------
+
+        username = os.getenv(
+            "FXCM_USERNAME"
+        )
+
+        password = os.getenv(
+            "FXCM_PASSWORD"
+        )
+
+        url = os.getenv(
+            "FXCM_URL"
+        )
+
+
+        if not username:
+
+            raise Exception(
+                "FXCM_USERNAME missing"
+            )
+
+
+        if not password:
+
+            raise Exception(
+                "FXCM_PASSWORD missing"
+            )
+
+
+        if not url:
+
+            raise Exception(
+                "FXCM_URL missing"
+            )
+
+
+        # ------------------------------------------
+        # Connect
+        # ------------------------------------------
+
+        print(
+            "🔄 Connecting FXCM...",
+            flush=True,
+        )
+
+
+        fx = ForexConnect()
+
+
+        try:
+
+            fx.login(
+                username,
+                password,
+                url,
+                "Demo",
+            )
+
+        except Exception:
+
+            try:
+                fx.logout()
+            except Exception:
+                pass
+
+            raise
+
+
+        fx_connection = fx
+
+
+        print(
+            "✅ FXCM Connected",
+            flush=True,
+        )
+
+
+        return fx_connection
+
+
+# ==================================================
+# GET CONNECTION
+# ==================================================
+
+def get_connection():
+
+    global fx_connection
+
+    if fx_connection is None:
+
+        return init_fxcm()
+
+
+    # ----------------------------------------------
+    # Check whether FXCM reports connected
+    # ----------------------------------------------
+
+    if not session_is_connected():
+
+        print(
+            "⚠️ FXCM session is not connected",
+            flush=True,
+        )
+
+        return reconnect_fxcm(
+            reason="session not connected"
+        )
+
+
+    return fx_connection
+
+
+# ==================================================
+# RECONNECT FXCM
+# ==================================================
+
+def reconnect_fxcm(reason="unknown"):
+
+    global fx_connection
+    global last_reconnect_attempt
+
+    with connection_lock:
+
+        now = time.monotonic()
+
+        elapsed = (
+            now
+            - last_reconnect_attempt
+        )
+
+
+        # ------------------------------------------
+        # Prevent rapid reconnect loops
+        # (only skip if connection is actually live)
+        # ------------------------------------------
+
+        if (
+            last_reconnect_attempt > 0
+            and elapsed < RECONNECT_COOLDOWN_SECONDS
+            and fx_connection is not None
+            and session_is_connected()
+        ):
+
+            print(
+                "⏳ FXCM reconnect cooldown active "
+                f"({reason})",
+                flush=True,
+            )
+
+            return fx_connection
+
+
+        last_reconnect_attempt = now
+
+
+        print(
+            f"🔄 Reconnecting FXCM: {reason}",
+            flush=True,
+        )
+
+
+        # ------------------------------------------
+        # Close existing connection
+        # ------------------------------------------
+
+        old_connection = fx_connection
+
+        fx_connection = None
+
+
+        if old_connection is not None:
+
+            try:
+
+                old_connection.logout()
+
+            except Exception:
+                pass
+
+
+        # Give the native library a moment
+        # to release the previous session.
+
+        time.sleep(1)
+
+
+        # ------------------------------------------
+        # Start new connection
+        # ------------------------------------------
+
+        new_connection = init_fxcm(
+            force=True
+        )
+
+
+        # Previous quote ages should no longer
+        # carry over after reconnecting.
+
+        last_quotes.clear()
+
+
+        print(
+            "✅ FXCM reconnect completed",
+            flush=True,
+        )
+
+
+        return new_connection
+
+
+# ==================================================
+# READ OFFER
+# ==================================================
+
+def _read_offer(fx, symbol):
+
+    offers = fx.get_table(
+        fxcorepy.O2GTableType.OFFERS
+    )
+
+
+    for row in offers:
+
+        fx_symbol = (
+            row.instrument
+            .replace("/", "")
+            .replace(" ", "")
+            .upper()
+        )
+
+
+        if fx_symbol == symbol:
+
+            bid = float(
+                row.bid
+            )
+
+            ask = float(
+                row.ask
+            )
+
+
+            return {
+                "symbol": row.instrument,
+                "bid": bid,
+                "ask": ask,
+            }
+
+
+    return None
+
+
+# ==================================================
+# UPDATE QUOTE HEALTH
+# ==================================================
+
+def _update_quote_health(
+    symbol,
+    bid,
+    ask,
+):
+
+    now = time.monotonic()
+
+    previous = last_quotes.get(
+        symbol
+    )
+
+
+    # ----------------------------------------------
+    # First quote
+    # ----------------------------------------------
+
+    if previous is None:
+
+        last_quotes[symbol] = {
+            "bid": bid,
+            "ask": ask,
+            "changed_at": now,
+        }
+
+
+        return {
+            "changed": True,
+            "age": 0.0,
+            "stale": False,
+        }
+
+
+    # ----------------------------------------------
+    # Quote changed
+    # ----------------------------------------------
+
+    if (
+        previous["bid"] != bid
+        or previous["ask"] != ask
+    ):
+
+        previous["bid"] = bid
+        previous["ask"] = ask
+        previous["changed_at"] = now
+
+
+        return {
+            "changed": True,
+            "age": 0.0,
+            "stale": False,
+        }
+
+
+    # ----------------------------------------------
+    # Quote unchanged
+    # ----------------------------------------------
+
+    age = (
+        now
+        - previous["changed_at"]
+    )
+
+
+    stale = (
+        market_should_be_active(symbol)
+        and age >= STALE_PRICE_SECONDS
+    )
+
+
+    return {
+        "changed": False,
+        "age": age,
+        "stale": stale,
+    }
+
+
+# ==================================================
+# GET PRICE
+# ==================================================
+
+def get_price(symbol):
+
+    if not FXCM_AVAILABLE:
+        raise Exception(
+            "FXCM not available on this platform (Linux only)"
+        )
+
+    original_symbol = symbol
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+
+    # --------------------------------------------------
+    # INDICES: use Yahoo Finance futures prices.
+    #
+    # FXCM demo accounts do not push live index ticks —
+    # the OFFERS table shows the same price for minutes.
+    # Yahoo Finance (NQ=F, ES=F, …) gives real-time data.
+    # --------------------------------------------------
+
+    if symbol in YAHOO_INDEX_MAP:
+
+        try:
+
+            data = _get_yahoo_index_price(symbol)
+
+            if data is not None:
+
+                bid = data["bid"]
+                ask = data["ask"]
+
+                health = _update_quote_health(
+                    symbol, bid, ask
+                )
+
+                _record_activity()
+
+                return {
+                    "symbol": data["symbol"],
+                    "bid": bid,
+                    "ask": ask,
+                    "quote_age": round(
+                        health["age"], 1
+                    ),
+                    "quote_changed": health["changed"],
+                    "stale": False,
+                }
+
+        except Exception as _yf_err:
+
+            print(
+                f"Yahoo index price failed for "
+                f"{original_symbol}: {_yf_err} — "
+                f"falling back to FXCM",
+                flush=True,
+            )
+
+
+    # Allow one reconnect / retry.
+    for attempt in range(2):
+
+        try:
+
+            fx = get_connection()
+
+
+            # --------------------------------------
+            # Read current offer
+            # --------------------------------------
+
+            data = _read_offer(
+                fx,
+                symbol,
+            )
+
+
+            if data is None:
+
+                raise LookupError(
+                    f"{original_symbol} not found"
+                )
+
+
+            bid = data["bid"]
+            ask = data["ask"]
+
+
+            # --------------------------------------
+            # Sanity checks
+            # --------------------------------------
+
+            if bid <= 0 or ask <= 0:
+
+                raise Exception(
+                    f"Invalid FXCM quote for "
+                    f"{original_symbol}: "
+                    f"bid={bid}, ask={ask}"
+                )
+
+
+            if ask < bid:
+
+                raise Exception(
+                    f"Invalid FXCM spread for "
+                    f"{original_symbol}: "
+                    f"bid={bid}, ask={ask}"
+                )
+
+
+            # --------------------------------------
+            # Track quote freshness
+            # --------------------------------------
+
+            health = _update_quote_health(
+                symbol,
+                bid,
+                ask,
+            )
+
+
+            # --------------------------------------
+            # Stale quote detected
+            # --------------------------------------
+
+            if health["stale"]:
+
+                age = int(
+                    health["age"]
+                )
+
+
+                print(
+                    f"⚠️ STALE FXCM PRICE | "
+                    f"{original_symbol} | "
+                    f"Bid: {bid} | "
+                    f"Ask: {ask} | "
+                    f"Unchanged: {age}s",
+                    flush=True,
+                )
+
+
+                # First detection:
+                # reconnect and try once more.
+
+                if attempt == 0:
+
+                    reconnect_fxcm(
+                        reason=(
+                            f"{original_symbol} "
+                            f"quote unchanged "
+                            f"for {age}s"
+                        )
+                    )
+
+                    continue
+
+
+                # Never allow a stale quote
+                # to reach the alert monitor.
+
+                raise Exception(
+                    f"FXCM stale price for "
+                    f"{original_symbol}"
+                )
+
+
+            # --------------------------------------
+            # Valid live quote
+            # --------------------------------------
+
+            _record_activity()
+
+            return {
+                "symbol": data["symbol"],
+                "bid": bid,
+                "ask": ask,
+                "quote_age": round(
+                    health["age"],
+                    1,
+                ),
+                "quote_changed": health[
+                    "changed"
+                ],
+                "stale": False,
+            }
+
+
+        # ------------------------------------------
+        # Invalid / unsupported symbol
+        # ------------------------------------------
+
+        except LookupError:
+
+            raise Exception(
+                f"{original_symbol} not found"
+            )
+
+
+        # ------------------------------------------
+        # FXCM / connection error
+        # ------------------------------------------
+
+        except Exception as e:
+
+            print(
+                f"FXCM price error "
+                f"({original_symbol}): {e}",
+                flush=True,
+            )
+
+
+            if attempt == 0:
+
+                try:
+
+                    reconnect_fxcm(
+                        reason=(
+                            f"price error for "
+                            f"{original_symbol}"
+                        )
+                    )
+
+                    continue
+
+
+                except Exception as reconnect_error:
+
+                    print(
+                        "❌ FXCM reconnect failed: "
+                        f"{reconnect_error}",
+                        flush=True,
+                    )
+
+
+            raise
+
+
+    raise Exception(
+        f"Unable to get FXCM price for "
+        f"{original_symbol}"
+    )
+
+
+# ==================================================
+# KEEPALIVE
+# ==================================================
+
+_last_activity = 0.0
+
+KEEPALIVE_INTERVAL_SECONDS = 270  # ping every 4.5 min; demo timeout is ~30 min
+
+
+def _record_activity():
+    global _last_activity
+    _last_activity = time.monotonic()
+
+
+def keepalive_if_needed():
+    """Fetch EURUSD to keep the FXCM session alive when no alerts are running."""
+
+    if not FXCM_AVAILABLE:
+        return
+
+    now = time.monotonic()
+
+    if now - _last_activity < KEEPALIVE_INTERVAL_SECONDS:
+        return
+
+    _record_activity()
+
+    try:
+        get_price("EURUSD")
+        print("🔄 FXCM keepalive OK", flush=True)
+
+    except Exception as e:
+        print(f"⚠️ FXCM keepalive failed: {e}", flush=True)
+        try:
+            reconnect_fxcm(reason="keepalive failed")
+        except Exception:
+            pass
+
+
+# ==================================================
+# VALIDATE SYMBOL
+# ==================================================
+
+def validate_symbol(symbol):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+
+    # ----------------------------------------------
+    # Known symbols
+    # ----------------------------------------------
+
+    if symbol in COMMON_FOREX:
+
+        return True
+
+
+    if symbol in COMMON_COMMODITIES:
+
+        return True
+
+
+    # ----------------------------------------------
+    # Check FXCM offers table
+    # ----------------------------------------------
+
+    try:
+
+        fx = get_connection()
+
+
+        offers = fx.get_table(
+            fxcorepy.O2GTableType.OFFERS
+        )
+
+
+        for row in offers:
+
+            fx_symbol = (
+                row.instrument
+                .replace("/", "")
+                .replace(" ", "")
+                .upper()
+            )
+
+
+            if fx_symbol == symbol:
+
+                return True
+
+
+    except Exception as e:
+
+        print(
+            "FXCM validation error:",
+            e,
+            flush=True,
+        )
+
+
+    return False
